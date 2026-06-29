@@ -419,7 +419,16 @@ with st.sidebar:
             "Request timeout (sec)", min_value=5, max_value=120, value=60, step=5
         )
 
-    run_btn = st.button("Run Extraction", type="primary", use_container_width=True)
+    col_run, col_stop = st.columns(2)
+    with col_run:
+        run_btn = st.button("Run Extraction", type="primary", use_container_width=True)
+    with col_stop:
+        stop_btn = st.button("Stop Processing", use_container_width=True)
+    
+    if stop_btn:
+        st.session_state.processing_state["is_running"] = False
+        st.info("Processing stopped. Results so far are displayed below.")
+        st.rerun()
 
 # Resolve NCTs
 ncts_from_file = load_ncts_from_upload(uploaded, colname or None, allow_scan)
@@ -457,6 +466,12 @@ if "processing_state" not in st.session_state:
         "is_running": False,
     }
 
+# Track if we're in a processing run (persists across reruns)
+if submitted:
+    st.session_state.processing_state["is_running"] = True
+
+submitted = submitted or st.session_state.processing_state.get("is_running", False)
+
 if submitted and not resolved_ncts:
     st.info(
         "To get started:\n"
@@ -485,12 +500,15 @@ if submitted:
     col1.metric("Total NCT IDs", total_ncts)
     col2.metric("Processed", processed_count)
     col3.metric("Remaining", len(remaining_ncts))
+    
+    st.divider()
 
     if not remaining_ncts:
         # All done
         state["is_running"] = False
         wide_rows = state["results"]
         errors = state["errors"]
+        st.success(f"✅ Processing complete! All {total_ncts} NCT IDs processed.")
     else:
         # Process a chunk (batch of 50 at a time to avoid long reruns)
         chunk_size = 50
@@ -541,46 +559,48 @@ if submitted:
         wide_rows = state["results"]
         errors = state["errors"]
 
-    # Display results once processing completes
-    if not state["is_running"]:
-        if not wide_rows:
-            st.error("No rows produced. Check errors or try a different set of NCT IDs.")
-            if errors:
-                with st.expander(f"Errors ({len(errors)} total)"):
-                    for nct, msg in errors[:100]:
-                        st.write(f"**{nct}** — {msg}")
-        else:
-            wide_df = pd.DataFrame(wide_rows)
-            # Reorder so nct_id is first
-            cols = wide_df.columns.tolist()
-            if "nct_id" in cols:
-                cols = ["nct_id"] + [c for c in cols if c != "nct_id"]
-                wide_df = wide_df[cols]
+    # Display results (show even while processing)
+    st.divider()
+    st.subheader("Results")
+    
+    wide_rows = state["results"]
+    errors = state["errors"]
+    
+    if wide_rows:
+        wide_df = pd.DataFrame(wide_rows)
+        # Reorder so nct_id is first
+        cols = wide_df.columns.tolist()
+        if "nct_id" in cols:
+            cols = ["nct_id"] + [c for c in cols if c != "nct_id"]
+            wide_df = wide_df[cols]
 
-            st.success(f"✅ Done. Extracted {len(wide_df)} records.")
-            st.dataframe(wide_df.head(50), use_container_width=True)
+        st.write(f"📊 **{len(wide_df)} records extracted so far**")
+        st.dataframe(wide_df.head(50), use_container_width=True)
 
-            # Export to Excel
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                wide_df.to_excel(writer, index=False, sheet_name="Demographics_Wide")
-            buf.seek(0)
-            st.download_button(
-                label="⬇️ Download Excel (Demographics_Wide)",
-                data=buf.getvalue(),
-                file_name="demographics_extracted.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+        # Export to Excel (always available)
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            wide_df.to_excel(writer, index=False, sheet_name="Demographics_Wide")
+        buf.seek(0)
+        st.download_button(
+            label="⬇️ Download Excel (Demographics_Wide)",
+            data=buf.getvalue(),
+            file_name="demographics_extracted.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
-            if errors:
-                err_df = pd.DataFrame(errors, columns=["nct_id", "error"])
-                st.download_button(
-                    "⬇️ Download failures (.csv)",
-                    err_df.to_csv(index=False).encode(),
-                    file_name="failures.csv",
-                    use_container_width=True,
-                )
-                with st.expander(f"Some records failed ({len(errors)} total, showing up to 100)"):
-                    for nct, msg in errors[:100]:
-                        st.write(f"**{nct}** — {msg}")
+    if errors:
+        err_df = pd.DataFrame(errors, columns=["nct_id", "error"])
+        st.download_button(
+            "⬇️ Download failures (.csv)",
+            err_df.to_csv(index=False).encode(),
+            file_name="failures.csv",
+            use_container_width=True,
+        )
+        with st.expander(f"⚠️ Failed records ({len(errors)} total, showing up to 100)"):
+            for nct, msg in errors[:100]:
+                st.write(f"**{nct}** — {msg}")
+    
+    if not state["is_running"] and not wide_rows:
+        st.error("❌ No records extracted. Check the errors above or verify your NCT IDs.")
