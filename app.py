@@ -165,7 +165,7 @@ def flatten_baseline_numbers_deep(study: Dict[str, Any], nct_id: str) -> pd.Data
         v = _to_float(val_raw)
         if v is None:
             return
-        # filter out “overall / total / all” in labels
+        # filter out "overall / total / all" in labels
         label_candidates = [
             x
             for x in label_path
@@ -445,6 +445,18 @@ if resolved_ncts:
 
 submitted = bool(run_btn)
 
+# ==================== RESUMABLE PROCESSING WITH SESSION STATE ====================
+
+# Initialize session state for resumable processing
+if "processing_state" not in st.session_state:
+    st.session_state.processing_state = {
+        "ncts": [],
+        "processed": set(),
+        "results": [],
+        "errors": [],
+        "is_running": False,
+    }
+
 if submitted and not resolved_ncts:
     st.info(
         "To get started:\n"
@@ -454,72 +466,121 @@ if submitted and not resolved_ncts:
     st.stop()
 
 if submitted:
-    prog = st.progress(0)
-    status = st.empty()
-    wide_rows: List[pd.Series] = []
-    errors: List[Tuple[str, str]] = []
+    state = st.session_state.processing_state
+    
+    # Start fresh batch if NCTs changed
+    if state["ncts"] != resolved_ncts:
+        state["ncts"] = resolved_ncts
+        state["processed"] = set()
+        state["results"] = []
+        state["errors"] = []
+        state["is_running"] = True
 
-    for i, nct in enumerate(resolved_ncts, start=1):
-        status.write(f"Fetching **{nct}** ({i}/{len(resolved_ncts)}) …")
-        try:
-            raw = fetch_study(nct, timeout=int(timeout_sec))
-            study = normalize_study(raw)
-            if not study:
-                raise RuntimeError("Empty or unknown study payload")
+    remaining_ncts = [n for n in state["ncts"] if n not in state["processed"]]
+    total_ncts = len(state["ncts"])
+    processed_count = len(state["processed"])
 
-            demo_df = flatten_baseline_numbers_deep(study, nct)
-            export_long = build_export_long(nct, demo_df, selected)
-            row = make_export_wide(export_long)
-            row["nct_id"] = nct
-            wide_rows.append(row)
+    # Display progress info
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total NCT IDs", total_ncts)
+    col2.metric("Processed", processed_count)
+    col3.metric("Remaining", len(remaining_ncts))
 
-        except Exception as e:
-            errors.append((nct, str(e)))
+    if not remaining_ncts:
+        # All done
+        state["is_running"] = False
+        wide_rows = state["results"]
+        errors = state["errors"]
+    else:
+        # Process a chunk (batch of 50 at a time to avoid long reruns)
+        chunk_size = 50
+        chunk = remaining_ncts[:chunk_size]
 
-        prog.progress(i / len(resolved_ncts))
-        if sleep_sec and float(sleep_sec) > 0:
-            time.sleep(float(sleep_sec))
+        prog = st.progress(processed_count / total_ncts)
+        status = st.empty()
 
-    if not wide_rows:
-        st.error("No rows produced. Check errors or try a different set of NCT IDs.")
-        if errors:
-            with st.expander("Errors"):
-                for nct, msg in errors[:100]:
-                    st.write(f"**{nct}** — {msg}")
-        st.stop()
+        for idx, nct in enumerate(chunk):
+            current_count = processed_count + idx + 1
+            progress_pct = current_count / total_ncts
+            status.write(
+                f"Fetching **{nct}** ({current_count}/{total_ncts}) …"
+            )
+            try:
+                raw = fetch_study(nct, timeout=int(timeout_sec))
+                study = normalize_study(raw)
+                if not study:
+                    raise RuntimeError("Empty or unknown study payload")
 
-    wide_df = pd.DataFrame(wide_rows)
-    # Reorder so nct_id is first
-    cols = wide_df.columns.tolist()
-    if "nct_id" in cols:
-        cols = ["nct_id"] + [c for c in cols if c != "nct_id"]
-        wide_df = wide_df[cols]
+                demo_df = flatten_baseline_numbers_deep(study, nct)
+                export_long = build_export_long(nct, demo_df, selected)
+                row = make_export_wide(export_long)
+                row["nct_id"] = nct
+                state["results"].append(row)
 
-    st.success(f"Done. Extracted {len(wide_df)} records.")
-    st.dataframe(wide_df.head(50), use_container_width=True)
+            except Exception as e:
+                state["errors"].append((nct, str(e)))
 
-    # Export to Excel
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        wide_df.to_excel(writer, index=False, sheet_name="Demographics_Wide")
-    buf.seek(0)
-    st.download_button(
-        label="⬇️ Download Excel (Demographics_Wide)",
-        data=buf.getvalue(),
-        file_name="demographics_extracted.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+            state["processed"].add(nct)
+            prog.progress(progress_pct)
 
-    if errors:
-        err_df = pd.DataFrame(errors, columns=["nct_id", "error"])
-        st.download_button(
-            "⬇️ Download failures (.csv)",
-            err_df.to_csv(index=False).encode(),
-            file_name="failures.csv",
-            use_container_width=True,
-        )
-        with st.expander("Some records failed (up to 100 shown)"):
-            for nct, msg in errors[:100]:
-                st.write(f"**{nct}** — {msg}")
+            if sleep_sec and float(sleep_sec) > 0:
+                time.sleep(float(sleep_sec))
 
+        # Rerun to process next chunk
+        if len(state["processed"]) < len(state["ncts"]):
+            st.info(
+                f"✅ Processed {len(state['processed'])}/{total_ncts} NCT IDs. "
+                f"Rerunning to fetch next batch..."
+            )
+            time.sleep(1)
+            st.rerun()
+        else:
+            state["is_running"] = False
+            st.success(f"✅ Done! All {total_ncts} NCT IDs have been processed.")
+
+        wide_rows = state["results"]
+        errors = state["errors"]
+
+    # Display results once processing completes
+    if not state["is_running"]:
+        if not wide_rows:
+            st.error("No rows produced. Check errors or try a different set of NCT IDs.")
+            if errors:
+                with st.expander(f"Errors ({len(errors)} total)"):
+                    for nct, msg in errors[:100]:
+                        st.write(f"**{nct}** — {msg}")
+        else:
+            wide_df = pd.DataFrame(wide_rows)
+            # Reorder so nct_id is first
+            cols = wide_df.columns.tolist()
+            if "nct_id" in cols:
+                cols = ["nct_id"] + [c for c in cols if c != "nct_id"]
+                wide_df = wide_df[cols]
+
+            st.success(f"✅ Done. Extracted {len(wide_df)} records.")
+            st.dataframe(wide_df.head(50), use_container_width=True)
+
+            # Export to Excel
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                wide_df.to_excel(writer, index=False, sheet_name="Demographics_Wide")
+            buf.seek(0)
+            st.download_button(
+                label="⬇️ Download Excel (Demographics_Wide)",
+                data=buf.getvalue(),
+                file_name="demographics_extracted.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+            if errors:
+                err_df = pd.DataFrame(errors, columns=["nct_id", "error"])
+                st.download_button(
+                    "⬇️ Download failures (.csv)",
+                    err_df.to_csv(index=False).encode(),
+                    file_name="failures.csv",
+                    use_container_width=True,
+                )
+                with st.expander(f"Some records failed ({len(errors)} total, showing up to 100)"):
+                    for nct, msg in errors[:100]:
+                        st.write(f"**{nct}** — {msg}")
