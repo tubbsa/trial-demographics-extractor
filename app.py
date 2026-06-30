@@ -446,7 +446,6 @@ if "proc_state" not in st.session_state:
         "results": [],
         "errors": [],
         "running": False,
-        "temp_file": None,
     }
 
 submitted = run_btn or st.session_state.proc_state["running"]
@@ -465,7 +464,6 @@ if submitted:
         proc["results"] = []
         proc["errors"] = []
         proc["running"] = True
-        proc["temp_file"] = f"/tmp/streamlit_demographics_{int(time.time())}.csv"
 
     remaining = [n for n in proc["ncts"] if n not in proc["processed"]]
     total = len(proc["ncts"])
@@ -500,12 +498,6 @@ if submitted:
                 # Convert Series to dict
                 row_dict = row.to_dict()
                 proc["results"].append(row_dict)
-                
-                # SAVE TO DISK IMMEDIATELY (prevents loss if crash)
-                if os.path.exists(proc["temp_file"]):
-                    pd.DataFrame([row_dict]).to_csv(proc["temp_file"], mode='a', header=False, index=False)
-                else:
-                    pd.DataFrame([row_dict]).to_csv(proc["temp_file"], mode='w', header=True, index=False)
                     
             except Exception as e:
                 proc["errors"].append((nct, str(e)))
@@ -523,20 +515,16 @@ if submitted:
         else:
             proc["running"] = False
 
-    if not proc["running"] and (proc["results"] or (proc["temp_file"] and os.path.exists(proc["temp_file"]))):
+    if not proc["running"] and proc["results"]:
         # All done, show results
         st.divider()
         
         try:
-            # Load from disk file if it exists (more reliable than session state)
-            if proc["temp_file"] and os.path.exists(proc["temp_file"]):
-                st.info("📊 Loading results from disk...")
-                wide_df = pd.read_csv(proc["temp_file"])
-            else:
-                st.info("📊 Building results table...")
-                wide_df = pd.DataFrame(proc["results"])
+            st.info("📊 Building results table...")
             
-            # Reorder columns
+            # Build DataFrame from dicts (lightweight, handles variable columns)
+            wide_df = pd.DataFrame(proc["results"])
+            
             cols = wide_df.columns.tolist()
             if "nct_id" in cols:
                 cols = ["nct_id"] + [c for c in cols if c != "nct_id"]
@@ -545,7 +533,7 @@ if submitted:
             st.success(f"✅ COMPLETE! Extracted {len(wide_df)} TOTAL records from {total} NCT IDs.")
             st.write(f"**Dataframe shape: {wide_df.shape[0]} rows × {wide_df.shape[1]} columns**")
             
-            # Show sample only
+            # Show sample
             st.info(f"Showing first 100 of {len(wide_df)} total records")
             st.dataframe(wide_df.head(100), use_container_width=True)
 
@@ -553,7 +541,7 @@ if submitted:
             st.write("---")
             st.subheader("📥 Download Results")
             
-            # Provide CSV (safest for large files)
+            # CSV (safest for all sizes)
             csv_data = wide_df.to_csv(index=False).encode()
             st.download_button(
                 "⬇️ Download CSV ({:,} records)".format(len(wide_df)),
@@ -563,7 +551,7 @@ if submitted:
                 use_container_width=True,
             )
             
-            # Try Excel too
+            # Excel (if not too large)
             try:
                 buf = io.BytesIO()
                 with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -583,9 +571,9 @@ if submitted:
                     use_container_width=True,
                 )
             except Exception as e:
-                st.warning(f"Excel export unavailable: {str(e)}")
+                st.warning(f"Excel export unavailable for this file size")
 
-            # Show errors
+            # Show errors if any
             if proc["errors"]:
                 err_df = pd.DataFrame(proc["errors"], columns=["nct_id", "error"])
                 st.write("---")
@@ -599,17 +587,10 @@ if submitted:
                 with st.expander(f"Show errors (up to 100 of {len(proc['errors'])})"):
                     for nct, msg in proc["errors"][:100]:
                         st.write(f"**{nct}** — {msg}")
-            
-            # Cleanup temp file after download
-            if proc["temp_file"] and os.path.exists(proc["temp_file"]):
-                try:
-                    os.remove(proc["temp_file"])
-                except:
-                    pass
                         
         except Exception as e:
-            st.error(f"❌ Error: {str(e)}")
-            st.info("Your data may have been saved. Check /tmp for .csv files.")
+            st.error(f"❌ Error building results: {str(e)}")
+            st.error("Try downloading from /tmp directory if file was created")
     elif not proc["running"] and not proc["results"]:
         st.error("No records extracted.")
         if proc["errors"]:
