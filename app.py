@@ -494,7 +494,10 @@ if submitted:
                 export_long = build_export_long(nct, demo_df, selected)
                 row = make_export_wide(export_long)
                 row["nct_id"] = nct
-                proc["results"].append(row)
+                
+                # Convert Series to dict to save memory
+                row_dict = row.to_dict()
+                proc["results"].append(row_dict)
             except Exception as e:
                 proc["errors"].append((nct, str(e)))
 
@@ -516,10 +519,11 @@ if submitted:
         st.divider()
         
         try:
-            st.info("Converting results to Excel... (this may take a moment for large datasets)")
+            st.info("📊 Building results table... (processing {} records)".format(len(proc["results"])))
             
-            # Build DataFrame safely
+            # Build DataFrame from dicts (more memory-efficient)
             wide_df = pd.DataFrame(proc["results"])
+            
             cols = wide_df.columns.tolist()
             if "nct_id" in cols:
                 cols = ["nct_id"] + [c for c in cols if c != "nct_id"]
@@ -528,69 +532,84 @@ if submitted:
             st.success(f"✅ COMPLETE! Extracted {len(wide_df)} TOTAL records from {total} NCT IDs.")
             st.write(f"**Dataframe shape: {wide_df.shape[0]} rows × {wide_df.shape[1]} columns**")
             
-            # Show sample instead of all rows (prevents browser freeze)
-            with st.expander(f"View data sample (showing first 100 of {len(wide_df)})"):
-                st.dataframe(wide_df.head(100), use_container_width=True)
+            # Show sample only (prevents browser freeze with 7000+ rows)
+            st.info(f"Showing sample of first 100 rows (out of {len(wide_df)} total)")
+            st.dataframe(wide_df.head(100), use_container_width=True)
 
-            # Download Excel with error handling
+            # Export to Excel with chunking for large files
             st.write("---")
             st.subheader("📥 Download Results")
+            
+            # Try Excel first
+            excel_success = False
             try:
+                st.info("Creating Excel file...")
                 buf = io.BytesIO()
                 with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                    wide_df.to_excel(writer, index=False, sheet_name="Demographics_Wide")
+                    # For very large files, might need to split into sheets
+                    if len(wide_df) > 1000000:
+                        # Split into multiple sheets of 100k rows each
+                        for i in range(0, len(wide_df), 100000):
+                            chunk_df = wide_df.iloc[i:i+100000]
+                            sheet_name = f"Data_{i//100000 + 1}"
+                            chunk_df.to_excel(writer, index=False, sheet_name=sheet_name)
+                    else:
+                        wide_df.to_excel(writer, index=False, sheet_name="Demographics_Wide")
                 buf.seek(0)
-                st.success(f"✅ Excel file ready: {len(wide_df)} records")
+                st.success(f"✅ Excel file created: {len(wide_df)} records")
                 st.download_button(
-                    "⬇️ Download Excel ({} records)".format(len(wide_df)),
+                    "⬇️ Download Excel ({:,} records)".format(len(wide_df)),
                     buf.getvalue(),
                     "demographics_extracted.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
+                excel_success = True
             except Exception as excel_err:
-                st.warning(f"Excel export failed: {str(excel_err)}")
-                st.info("Downloading as CSV instead...")
+                st.warning(f"⚠️ Excel export failed ({str(excel_err)}). Using CSV instead.")
+            
+            # Always provide CSV as backup
+            if not excel_success or len(wide_df) > 500000:
+                st.info("Generating CSV (more compatible for large datasets)...")
                 csv_data = wide_df.to_csv(index=False).encode()
                 st.download_button(
-                    "⬇️ Download CSV ({} records)".format(len(wide_df)),
+                    "⬇️ Download CSV ({:,} records)".format(len(wide_df)),
                     csv_data,
                     "demographics_extracted.csv",
                     "text/csv",
                     use_container_width=True,
                 )
 
-            # Download errors if any
+            # Show errors if any
             if proc["errors"]:
                 err_df = pd.DataFrame(proc["errors"], columns=["nct_id", "error"])
                 st.write("---")
-                st.warning(f"⚠️ {len(proc['errors'])} NCT IDs failed to extract:")
+                st.warning(f"⚠️ {len(proc['errors'])} NCT IDs failed to extract")
                 st.download_button(
                     "⬇️ Download failures ({} records)".format(len(proc['errors'])),
                     err_df.to_csv(index=False).encode(),
                     "failures.csv",
                     use_container_width=True,
                 )
-                with st.expander(f"Show all {len(proc['errors'])} errors"):
-                    for nct, msg in proc["errors"]:
+                with st.expander(f"Show errors (up to 100 of {len(proc['errors'])})"):
+                    for nct, msg in proc["errors"][:100]:
                         st.write(f"**{nct}** — {msg}")
                         
         except Exception as e:
-            st.error(f"❌ Error processing results: {str(e)}")
-            st.info(f"Successfully extracted {len(proc['results'])} records before error")
-            if proc["results"]:
-                st.write("Attempting to save as CSV fallback...")
-                try:
-                    wide_df = pd.DataFrame(proc["results"])
-                    csv_data = wide_df.to_csv(index=False).encode()
-                    st.download_button(
-                        "⬇️ Download as CSV (fallback)",
-                        csv_data,
-                        "demographics_fallback.csv",
-                        use_container_width=True,
-                    )
-                except Exception as fallback_err:
-                    st.error(f"Fallback also failed: {str(fallback_err)}")
+            st.error(f"❌ Unexpected error: {str(e)}")
+            st.write("Attempting emergency CSV export...")
+            try:
+                wide_df = pd.DataFrame(proc["results"])
+                csv_data = wide_df.to_csv(index=False).encode()
+                st.download_button(
+                    "⬇️ Download Emergency CSV",
+                    csv_data,
+                    "demographics_emergency.csv",
+                    use_container_width=True,
+                )
+                st.success(f"✅ Emergency export successful: {len(wide_df)} records")
+            except Exception as e2:
+                st.error(f"Emergency export also failed: {str(e2)}")
     elif not proc["running"] and not proc["results"]:
         st.error("No records extracted.")
         if proc["errors"]:
