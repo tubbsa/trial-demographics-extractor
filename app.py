@@ -477,7 +477,7 @@ if submitted:
 
     if remaining:
         # Process next 50
-        chunk = remaining[:50]
+        chunk = remaining[:25]
         prog = st.progress(done / total)
         status = st.empty()
 
