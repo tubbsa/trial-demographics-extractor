@@ -513,38 +513,45 @@ if submitted:
 
     if not proc["running"] and proc["results"]:
         # All done, show results
+        st.divider()
         wide_df = pd.DataFrame(proc["results"])
         cols = wide_df.columns.tolist()
         if "nct_id" in cols:
             cols = ["nct_id"] + [c for c in cols if c != "nct_id"]
             wide_df = wide_df[cols]
 
-        st.success(f"✅ Done! Extracted {len(wide_df)} records.")
-        st.dataframe(wide_df.head(50), use_container_width=True)
+        st.success(f"✅ COMPLETE! Extracted {len(wide_df)} TOTAL records from {total} NCT IDs.")
+        st.write(f"**Dataframe shape: {wide_df.shape[0]} rows × {wide_df.shape[1]} columns**")
+        st.dataframe(wide_df, use_container_width=True)  # Show ALL rows, not just first 50
 
-        # Download
+        # Download Excel
+        st.write("---")
+        st.subheader("📥 Download Results")
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             wide_df.to_excel(writer, index=False, sheet_name="Demographics_Wide")
         buf.seek(0)
+        st.info(f"✅ Excel file ready: {len(wide_df)} records")
         st.download_button(
-            "⬇️ Download Excel",
+            "⬇️ Download Excel ({} records)".format(len(wide_df)),
             buf.getvalue(),
-            "demographics.xlsx",
+            "demographics_extracted.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
 
         if proc["errors"]:
             err_df = pd.DataFrame(proc["errors"], columns=["nct_id", "error"])
+            st.write("---")
+            st.warning(f"⚠️ {len(proc['errors'])} NCT IDs failed to extract:")
             st.download_button(
-                "⬇️ Download errors",
+                "⬇️ Download failures ({} records)".format(len(proc['errors'])),
                 err_df.to_csv(index=False).encode(),
-                "errors.csv",
+                "failures.csv",
                 use_container_width=True,
             )
-            with st.expander(f"Failed ({len(proc['errors'])} total)"):
-                for nct, msg in proc["errors"][:100]:
+            with st.expander(f"Show all {len(proc['errors'])} errors"):
+                for nct, msg in proc["errors"]:
                     st.write(f"**{nct}** — {msg}")
     elif not proc["running"] and not proc["results"]:
         st.error("No records extracted.")
