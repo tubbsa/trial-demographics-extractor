@@ -477,7 +477,7 @@ if submitted:
 
     if remaining:
         # Process next 50
-        chunk = remaining[:25]
+        chunk = remaining[:50]
         prog = st.progress(done / total)
         status = st.empty()
 
@@ -514,45 +514,83 @@ if submitted:
     if not proc["running"] and proc["results"]:
         # All done, show results
         st.divider()
-        wide_df = pd.DataFrame(proc["results"])
-        cols = wide_df.columns.tolist()
-        if "nct_id" in cols:
-            cols = ["nct_id"] + [c for c in cols if c != "nct_id"]
-            wide_df = wide_df[cols]
+        
+        try:
+            st.info("Converting results to Excel... (this may take a moment for large datasets)")
+            
+            # Build DataFrame safely
+            wide_df = pd.DataFrame(proc["results"])
+            cols = wide_df.columns.tolist()
+            if "nct_id" in cols:
+                cols = ["nct_id"] + [c for c in cols if c != "nct_id"]
+                wide_df = wide_df[cols]
 
-        st.success(f"✅ COMPLETE! Extracted {len(wide_df)} TOTAL records from {total} NCT IDs.")
-        st.write(f"**Dataframe shape: {wide_df.shape[0]} rows × {wide_df.shape[1]} columns**")
-        st.dataframe(wide_df, use_container_width=True)  # Show ALL rows, not just first 50
+            st.success(f"✅ COMPLETE! Extracted {len(wide_df)} TOTAL records from {total} NCT IDs.")
+            st.write(f"**Dataframe shape: {wide_df.shape[0]} rows × {wide_df.shape[1]} columns**")
+            
+            # Show sample instead of all rows (prevents browser freeze)
+            with st.expander(f"View data sample (showing first 100 of {len(wide_df)})"):
+                st.dataframe(wide_df.head(100), use_container_width=True)
 
-        # Download Excel
-        st.write("---")
-        st.subheader("📥 Download Results")
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            wide_df.to_excel(writer, index=False, sheet_name="Demographics_Wide")
-        buf.seek(0)
-        st.info(f"✅ Excel file ready: {len(wide_df)} records")
-        st.download_button(
-            "⬇️ Download Excel ({} records)".format(len(wide_df)),
-            buf.getvalue(),
-            "demographics_extracted.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-        if proc["errors"]:
-            err_df = pd.DataFrame(proc["errors"], columns=["nct_id", "error"])
+            # Download Excel with error handling
             st.write("---")
-            st.warning(f"⚠️ {len(proc['errors'])} NCT IDs failed to extract:")
-            st.download_button(
-                "⬇️ Download failures ({} records)".format(len(proc['errors'])),
-                err_df.to_csv(index=False).encode(),
-                "failures.csv",
-                use_container_width=True,
-            )
-            with st.expander(f"Show all {len(proc['errors'])} errors"):
-                for nct, msg in proc["errors"]:
-                    st.write(f"**{nct}** — {msg}")
+            st.subheader("📥 Download Results")
+            try:
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                    wide_df.to_excel(writer, index=False, sheet_name="Demographics_Wide")
+                buf.seek(0)
+                st.success(f"✅ Excel file ready: {len(wide_df)} records")
+                st.download_button(
+                    "⬇️ Download Excel ({} records)".format(len(wide_df)),
+                    buf.getvalue(),
+                    "demographics_extracted.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            except Exception as excel_err:
+                st.warning(f"Excel export failed: {str(excel_err)}")
+                st.info("Downloading as CSV instead...")
+                csv_data = wide_df.to_csv(index=False).encode()
+                st.download_button(
+                    "⬇️ Download CSV ({} records)".format(len(wide_df)),
+                    csv_data,
+                    "demographics_extracted.csv",
+                    "text/csv",
+                    use_container_width=True,
+                )
+
+            # Download errors if any
+            if proc["errors"]:
+                err_df = pd.DataFrame(proc["errors"], columns=["nct_id", "error"])
+                st.write("---")
+                st.warning(f"⚠️ {len(proc['errors'])} NCT IDs failed to extract:")
+                st.download_button(
+                    "⬇️ Download failures ({} records)".format(len(proc['errors'])),
+                    err_df.to_csv(index=False).encode(),
+                    "failures.csv",
+                    use_container_width=True,
+                )
+                with st.expander(f"Show all {len(proc['errors'])} errors"):
+                    for nct, msg in proc["errors"]:
+                        st.write(f"**{nct}** — {msg}")
+                        
+        except Exception as e:
+            st.error(f"❌ Error processing results: {str(e)}")
+            st.info(f"Successfully extracted {len(proc['results'])} records before error")
+            if proc["results"]:
+                st.write("Attempting to save as CSV fallback...")
+                try:
+                    wide_df = pd.DataFrame(proc["results"])
+                    csv_data = wide_df.to_csv(index=False).encode()
+                    st.download_button(
+                        "⬇️ Download as CSV (fallback)",
+                        csv_data,
+                        "demographics_fallback.csv",
+                        use_container_width=True,
+                    )
+                except Exception as fallback_err:
+                    st.error(f"Fallback also failed: {str(fallback_err)}")
     elif not proc["running"] and not proc["results"]:
         st.error("No records extracted.")
         if proc["errors"]:
