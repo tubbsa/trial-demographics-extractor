@@ -520,9 +520,9 @@ if submitted:
         st.divider()
         
         try:
-            st.info("📊 Building results table...")
+            st.info("📊 Preparing download file...")
             
-            # Build DataFrame from dicts (lightweight, handles variable columns)
+            # Build DataFrame and write directly to file (not keeping in memory for display)
             wide_df = pd.DataFrame(proc["results"])
             
             cols = wide_df.columns.tolist()
@@ -530,56 +530,52 @@ if submitted:
                 cols = ["nct_id"] + [c for c in cols if c != "nct_id"]
                 wide_df = wide_df[cols]
 
-            st.success(f"✅ COMPLETE! Extracted {len(wide_df)} TOTAL records from {total} NCT IDs.")
-            st.write(f"**Dataframe shape: {wide_df.shape[0]} rows × {wide_df.shape[1]} columns**")
+            record_count = len(wide_df)
+            st.success(f"✅ COMPLETE! Extracted {record_count:,} TOTAL records from {total} NCT IDs.")
+            st.write(f"**Total columns: {len(wide_df.columns)}**")
             
-            # Show sample
-            st.info(f"Showing first 100 of {len(wide_df)} total records")
-            st.dataframe(wide_df.head(100), use_container_width=True)
-
             # Export results
             st.write("---")
-            st.subheader("📥 Download Results")
+            st.subheader("📥 Download Your Data")
             
-            # CSV (safest for all sizes)
-            csv_data = wide_df.to_csv(index=False).encode()
-            st.download_button(
-                "⬇️ Download CSV ({:,} records)".format(len(wide_df)),
-                csv_data,
-                "demographics_extracted.csv",
-                "text/csv",
-                use_container_width=True,
-            )
-            
-            # Excel (if not too large)
+            # CSV (safest, always works)
+            try:
+                csv_data = wide_df.to_csv(index=False).encode()
+                st.download_button(
+                    f"⬇️ Download CSV ({record_count:,} records)",
+                    csv_data,
+                    "demographics_extracted.csv",
+                    "text/csv",
+                    use_container_width=True,
+                )
+                st.success("✅ CSV ready for download")
+            except Exception as csv_err:
+                st.error(f"CSV export failed: {str(csv_err)}")
+
+            # Excel (best effort)
             try:
                 buf = io.BytesIO()
                 with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                    if len(wide_df) > 1000000:
-                        for i in range(0, len(wide_df), 100000):
-                            chunk_df = wide_df.iloc[i:i+100000]
-                            sheet_name = f"Data_{i//100000 + 1}"
-                            chunk_df.to_excel(writer, index=False, sheet_name=sheet_name)
-                    else:
-                        wide_df.to_excel(writer, index=False, sheet_name="Demographics_Wide")
+                    wide_df.to_excel(writer, index=False, sheet_name="Demographics_Wide")
                 buf.seek(0)
                 st.download_button(
-                    "⬇️ Download Excel ({:,} records)".format(len(wide_df)),
+                    f"⬇️ Download Excel ({record_count:,} records)",
                     buf.getvalue(),
                     "demographics_extracted.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
-            except Exception as e:
-                st.warning(f"Excel export unavailable for this file size")
+                st.success("✅ Excel also available")
+            except Exception as excel_err:
+                st.warning(f"Excel unavailable (file too large): {str(excel_err)}")
 
             # Show errors if any
             if proc["errors"]:
                 err_df = pd.DataFrame(proc["errors"], columns=["nct_id", "error"])
                 st.write("---")
-                st.warning(f"⚠️ {len(proc['errors'])} NCT IDs failed")
+                st.warning(f"⚠️ {len(proc['errors'])} NCT IDs failed to extract")
                 st.download_button(
-                    "⬇️ Download failures ({} records)".format(len(proc['errors'])),
+                    f"⬇️ Download failures ({len(proc['errors'])} records)",
                     err_df.to_csv(index=False).encode(),
                     "failures.csv",
                     use_container_width=True,
@@ -587,10 +583,13 @@ if submitted:
                 with st.expander(f"Show errors (up to 100 of {len(proc['errors'])})"):
                     for nct, msg in proc["errors"][:100]:
                         st.write(f"**{nct}** — {msg}")
+            else:
+                st.success("✅ All trials processed successfully - no failures!")
                         
         except Exception as e:
-            st.error(f"❌ Error building results: {str(e)}")
-            st.error("Try downloading from /tmp directory if file was created")
+            st.error(f"❌ Error preparing download: {str(e)}")
+            if proc["results"]:
+                st.write(f"But we still have {len(proc['results'])} extracted records in memory")
     elif not proc["running"] and not proc["results"]:
         st.error("No records extracted.")
         if proc["errors"]:
