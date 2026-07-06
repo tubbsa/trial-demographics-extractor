@@ -596,12 +596,16 @@ if submitted:
 
     # Always-available checkpoint download so partial progress is never
     # trapped in memory if something does go wrong before the run finishes.
+    # Converted to CSV here (rather than handing back the raw .jsonl
+    # checkpoint file) so it's directly openable in Excel/Sheets.
     if done > 0 and os.path.exists(PROGRESS_PATH):
-        with open(PROGRESS_PATH, "rb") as f:
+        progress_df = jsonl_to_dataframe(PROGRESS_PATH)
+        if not progress_df.empty:
             st.download_button(
                 f"⬇️ Download progress so far ({done:,} of {total:,} trials)",
-                f.read(),
-                "demographics_progress.jsonl",
+                progress_df.to_csv(index=False).encode(),
+                "demographics_progress.csv",
+                "text/csv",
                 use_container_width=True,
             )
 
@@ -666,6 +670,10 @@ if submitted:
 
             st.info(f"Showing first 100 of {len(wide_df)} total records")
             st.dataframe(wide_df.head(100), use_container_width=True)
+            st.caption(
+                "Note: the ⭳ icon in the corner of this table only exports the "
+                "100 rows shown above. Use the full-dataset download buttons below."
+            )
 
             st.write("---")
             st.subheader("📥 Download Results")
