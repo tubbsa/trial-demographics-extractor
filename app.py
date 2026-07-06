@@ -553,9 +553,19 @@ if "proc_state" not in st.session_state:
     st.session_state.proc_state = {
         "ncts": [],
         "running": False,
+        "completed": False,
     }
 
-submitted = run_btn or st.session_state.proc_state["running"]
+# `submitted` gates the whole processing/results block. It must stay True
+# after the run finishes (proc["completed"]) so that later reruns -- e.g.
+# a user clicking one of the download buttons below, which Streamlit
+# handles by rerunning the whole script -- still render the results
+# instead of falling back to the "click Run Extraction" placeholder.
+submitted = (
+    run_btn
+    or st.session_state.proc_state["running"]
+    or st.session_state.proc_state.get("completed", False)
+)
 
 if submitted and not resolved_ncts:
     st.info("To get started:\n1) Upload a file or paste NCT IDs\n2) Click **Run Extraction**")
@@ -568,6 +578,7 @@ if submitted:
     if proc["ncts"] != resolved_ncts or (run_btn and fresh_start):
         proc["ncts"] = resolved_ncts
         proc["running"] = True
+        proc["completed"] = False
         reset_progress_files()
 
     # What's already done, read straight from disk -- this is what makes
@@ -630,8 +641,14 @@ if submitted:
             time.sleep(0.5)
             st.rerun()
         else:
+            # Finished. Do NOT st.rerun() here -- on the rerun, run_btn is
+            # False (it's only True on an actual button click) and
+            # `running` is now False too, so `submitted` would evaluate to
+            # False and the results section below would never render.
+            # Instead, fall through in this same script execution straight
+            # into the results/download block.
             proc["running"] = False
-            st.rerun()
+            proc["completed"] = True
 
     if not proc["running"]:
         st.divider()
