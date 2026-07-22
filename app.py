@@ -113,6 +113,12 @@ GENDER_BUCKETS = {
 PROGRESS_PATH = "/tmp/demographics_progress.jsonl"
 ERRORS_PATH = "/tmp/demographics_errors.jsonl"
 
+# Free-text fields (summaries, eligibility criteria) are truncated rather
+# than dropped, so a handful of unusually long trials can't blow out a
+# single Excel/CSV cell or balloon memory across ~7,900 trials.
+_MAX_LONG_TEXT = 32000
+_MAX_DETAILED_DESC = 6000
+
 # ================= HTTP Session =================================
 
 def _make_session(total_retries: int = 5, backoff: float = 0.5) -> requests.Session:
@@ -176,6 +182,20 @@ def normalize_bucket(category: str, bucket_map: Dict[str, str]) -> str:
             return bucket
     return slugify(category) if category else "unspecified"
 
+def _join(items: Optional[List[Any]], sep: str = "; ", limit: Optional[int] = None) -> str:
+    if not items:
+        return ""
+    vals = [str(x).strip() for x in items if x not in (None, "")]
+    if limit:
+        vals = vals[:limit]
+    return sep.join(vals)
+
+def _trunc(s: Any, n: int = _MAX_LONG_TEXT) -> Optional[str]:
+    if s is None:
+        return None
+    s = str(s)
+    return s if len(s) <= n else s[:n] + " …[truncated]"
+
 # ================= API (no long-lived caching of raw payloads) =================
 # NOTE: fetch_study is intentionally NOT wrapped in @st.cache_data. Caching
 # every raw CT.gov JSON payload for the life of the app session was the
@@ -205,6 +225,113 @@ def normalize_study(data: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(data.get("studies"), list) and data["studies"]:
         return data["studies"][0]
     return data
+
+# ============== Full protocol/trial-info extractor ==============
+# Pulls the "everything else" about a trial -- identification, status,
+# sponsors, design, arms/interventions, outcomes, eligibility, and
+# locations -- from protocolSection. This is independent of the results
+# payload used for demographics, so it works even for trials that have no
+# posted results yet (most trials on CT.gov have protocol data but not
+# results data).
+
+def extract_protocol_fields(study: Dict[str, Any]) -> Dict[str, Any]:
+    ps = study.get("protocolSection") or {}
+
+    ident = ps.get("identificationModule") or {}
+    status = ps.get("statusModule") or {}
+    sponsor = ps.get("sponsorCollaboratorsModule") or {}
+    desc = ps.get("descriptionModule") or {}
+    cond = ps.get("conditionsModule") or {}
+    design = ps.get("designModule") or {}
+    arms_mod = ps.get("armsInterventionsModule") or {}
+    outcomes = ps.get("outcomesModule") or {}
+    elig = ps.get("eligibilityModule") or {}
+    contacts = ps.get("contactsLocationsModule") or {}
+
+    lead_sponsor = (sponsor.get("leadSponsor") or {}).get("name")
+    collaborators = [c.get("name") for c in (sponsor.get("collaborators") or [])]
+
+    design_info = design.get("designInfo") or {}
+    enrollment = design.get("enrollmentInfo") or {}
+    masking_info = design_info.get("maskingInfo") or {}
+
+    arm_groups = arms_mod.get("armGroups") or []
+    arm_strs = [
+        f"{a.get('label', '')} ({a.get('type', '')})".strip()
+        for a in arm_groups
+        if a.get("label") or a.get("type")
+    ]
+
+    interventions = arms_mod.get("interventions") or []
+    interv_strs = [
+        f"{i.get('type', '')}: {i.get('name', '')}".strip(": ").strip()
+        for i in interventions
+        if i.get("name")
+    ]
+
+    primary_outcomes = outcomes.get("primaryOutcomes") or []
+    secondary_outcomes = outcomes.get("secondaryOutcomes") or []
+
+    locations = contacts.get("locations") or []
+    loc_strs = [
+        ", ".join(
+            filter(None, [l.get("facility"), l.get("city"), l.get("state"), l.get("country")])
+        )
+        for l in locations
+    ]
+
+    return {
+        "brief_title": ident.get("briefTitle"),
+        "official_title": ident.get("officialTitle"),
+        "acronym": ident.get("acronym"),
+        "overall_status": status.get("overallStatus"),
+        "why_stopped": status.get("whyStopped"),
+        "start_date": (status.get("startDateStruct") or {}).get("date"),
+        "primary_completion_date": (status.get("primaryCompletionDateStruct") or {}).get("date"),
+        "completion_date": (status.get("completionDateStruct") or {}).get("date"),
+        "study_first_posted": (status.get("studyFirstPostDateStruct") or {}).get("date"),
+        "last_update_posted": (status.get("lastUpdatePostDateStruct") or {}).get("date"),
+        "lead_sponsor": lead_sponsor,
+        "collaborators": _join(collaborators),
+        "conditions": _join(cond.get("conditions")),
+        "keywords": _join(cond.get("keywords")),
+        "study_type": design.get("studyType"),
+        "phases": _join(design.get("phases")),
+        "allocation": design_info.get("allocation"),
+        "intervention_model": design_info.get("interventionModel"),
+        "primary_purpose": design_info.get("primaryPurpose"),
+        "masking": masking_info.get("masking"),
+        "enrollment_count": enrollment.get("count"),
+        "enrollment_type": enrollment.get("type"),
+        "arms": _join(arm_strs),
+        "interventions": _join(interv_strs),
+        "primary_outcomes": _join([o.get("measure") for o in primary_outcomes], limit=15),
+        "secondary_outcomes": _join([o.get("measure") for o in secondary_outcomes], limit=15),
+        "eligibility_sex": elig.get("sex"),
+        "minimum_age": elig.get("minimumAge"),
+        "maximum_age": elig.get("maximumAge"),
+        "healthy_volunteers": elig.get("healthyVolunteers"),
+        "eligibility_criteria": _trunc(elig.get("eligibilityCriteria")),
+        "locations_count": len(locations),
+        "locations": _join(loc_strs, limit=25),
+        "brief_summary": _trunc(desc.get("briefSummary")),
+        "detailed_description": _trunc(desc.get("detailedDescription"), _MAX_DETAILED_DESC),
+    }
+
+# Column order for the trial-info block, so it reads naturally left-to-right
+# regardless of dict insertion order coming back from json normalization.
+PROTOCOL_FIELD_ORDER = [
+    "brief_title", "official_title", "acronym", "overall_status", "why_stopped",
+    "start_date", "primary_completion_date", "completion_date",
+    "study_first_posted", "last_update_posted",
+    "lead_sponsor", "collaborators", "conditions", "keywords",
+    "study_type", "phases", "allocation", "intervention_model",
+    "primary_purpose", "masking", "enrollment_count", "enrollment_type",
+    "arms", "interventions", "primary_outcomes", "secondary_outcomes",
+    "eligibility_sex", "minimum_age", "maximum_age", "healthy_volunteers",
+    "eligibility_criteria", "locations_count", "locations",
+    "brief_summary", "detailed_description",
+]
 
 # ============== Baseline demographics walker =============
 
@@ -302,11 +429,11 @@ def measure_kind(title: str) -> str:
         return "age"
     return "other"
 
-def build_wide_row(nct_id: str, demo_rows: List[Dict[str, Any]], selected_measures: List[str]) -> Dict[str, Any]:
-    """Collapse one trial's demographic rows into a single flat dict with
-    bounded, normalized column names (so ~7,900 trials don't produce
-    thousands of near-duplicate columns from inconsistent CT.gov label text)."""
-    out: Dict[str, Any] = {"nct_id": nct_id}
+def build_demo_columns(demo_rows: List[Dict[str, Any]], selected_measures: List[str]) -> Dict[str, Any]:
+    """Collapse one trial's demographic rows into bounded, normalized
+    column names (so ~7,900 trials don't produce thousands of
+    near-duplicate columns from inconsistent CT.gov label text)."""
+    out: Dict[str, Any] = {}
 
     for r in demo_rows:
         measure = measure_kind(r.get("measure_title") or "")
@@ -346,8 +473,30 @@ def build_wide_row(nct_id: str, demo_rows: List[Dict[str, Any]], selected_measur
             col = f"{measure}_{norm_cat}{suffix}"
             out[col] = value
 
-    for c in ["age_mean", "age_sd", "age_median"]:
-        out.setdefault(c, None)
+    if "age" in selected_measures:
+        for c in ["age_mean", "age_sd", "age_median"]:
+            out.setdefault(c, None)
+
+    return out
+
+def build_wide_row(
+    nct_id: str,
+    study: Dict[str, Any],
+    selected_measures: List[str],
+    include_trial_info: bool,
+) -> Dict[str, Any]:
+    """Assemble one output row: nct_id, then (optionally) the full trial-info
+    block, then the demographic columns for the selected measures."""
+    out: Dict[str, Any] = {"nct_id": nct_id}
+
+    if include_trial_info:
+        protocol_fields = extract_protocol_fields(study)
+        for col in PROTOCOL_FIELD_ORDER:
+            out[col] = protocol_fields.get(col)
+
+    if selected_measures:
+        demo_rows = flatten_baseline_numbers_deep(study, nct_id)
+        out.update(build_demo_columns(demo_rows, selected_measures))
 
     return out
 
@@ -464,8 +613,11 @@ def reset_progress_files():
 # ================= Streamlit UI =================
 
 st.set_page_config(page_title="CT.gov Demographics Selector", page_icon="📊", layout="wide")
-st.title("📊 ClinicalTrials.gov — Demographics Selector")
-st.caption("Upload NCT IDs, choose which features (Age, Gender, Race, Ethnicity), then download Excel.")
+st.title("📊 ClinicalTrials.gov — Trial & Demographics Extractor")
+st.caption(
+    "Upload NCT IDs, choose which fields to pull (full trial info and/or baseline "
+    "demographics), then download Excel."
+)
 
 with st.sidebar:
     st.header("1) Input NCT IDs")
@@ -486,7 +638,16 @@ with st.sidebar:
     )
 
     st.divider()
-    st.header("2) Demographic Features to Extract")
+    st.header("2) Fields to Extract")
+
+    trial_info_sel = st.checkbox(
+        "Full trial info (title, status, sponsor, design, arms/interventions, "
+        "outcomes, eligibility, locations, summary)",
+        value=True,
+        help="Pulled from protocolSection -- available even for trials with no posted results.",
+    )
+
+    st.markdown("**Baseline demographics** (from posted results, if available)")
     age_sel = st.checkbox("Age", value=True)
     gender_sel = st.checkbox("Gender", value=True)
     race_sel = st.checkbox("Race", value=True)
@@ -500,6 +661,9 @@ with st.sidebar:
         selected.append("race")
     if ethnic_sel:
         selected.append("ethnicity")
+
+    if not trial_info_sel and not selected:
+        st.warning("Select at least one field group above.")
 
     st.divider()
     st.header("3) Options")
@@ -571,6 +735,10 @@ if submitted and not resolved_ncts:
     st.info("To get started:\n1) Upload a file or paste NCT IDs\n2) Click **Run Extraction**")
     st.stop()
 
+if submitted and not trial_info_sel and not selected:
+    st.error("Select at least one field group in the sidebar (trial info and/or demographics).")
+    st.stop()
+
 if submitted:
     proc = st.session_state.proc_state
 
@@ -604,7 +772,7 @@ if submitted:
             st.download_button(
                 f"⬇️ Download progress so far ({done:,} of {total:,} trials)",
                 progress_df.to_csv(index=False).encode(),
-                "demographics_progress.csv",
+                "trials_progress.csv",
                 "text/csv",
                 use_container_width=True,
             )
@@ -624,12 +792,11 @@ if submitted:
                 if not study:
                     raise RuntimeError("Empty study")
 
-                demo_rows = flatten_baseline_numbers_deep(study, nct)
-                row_dict = build_wide_row(nct, demo_rows, selected)
+                row_dict = build_wide_row(nct, study, selected, trial_info_sel)
                 append_jsonl(PROGRESS_PATH, row_dict)
 
                 # Drop references immediately rather than waiting on scope exit
-                del raw, study, demo_rows, row_dict
+                del raw, study, row_dict
             except Exception as e:
                 append_jsonl(ERRORS_PATH, {"nct_id": nct, "error": str(e)})
 
@@ -682,7 +849,7 @@ if submitted:
             st.download_button(
                 "⬇️ Download CSV ({:,} records)".format(len(wide_df)),
                 csv_data,
-                "demographics_extracted.csv",
+                "trials_extracted.csv",
                 "text/csv",
                 use_container_width=True,
             )
@@ -696,12 +863,12 @@ if submitted:
                             sheet_name = f"Data_{i // 100_000 + 1}"
                             chunk_df.to_excel(writer, index=False, sheet_name=sheet_name)
                     else:
-                        wide_df.to_excel(writer, index=False, sheet_name="Demographics_Wide")
+                        wide_df.to_excel(writer, index=False, sheet_name="Trials_Wide")
                 buf.seek(0)
                 st.download_button(
                     "⬇️ Download Excel ({:,} records)".format(len(wide_df)),
                     buf.getvalue(),
-                    "demographics_extracted.xlsx",
+                    "trials_extracted.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
