@@ -248,7 +248,9 @@ def extract_protocol_fields(study: Dict[str, Any]) -> Dict[str, Any]:
     elig = ps.get("eligibilityModule") or {}
     contacts = ps.get("contactsLocationsModule") or {}
 
-    lead_sponsor = (sponsor.get("leadSponsor") or {}).get("name")
+    lead_sponsor_info = sponsor.get("leadSponsor") or {}
+    lead_sponsor = lead_sponsor_info.get("name")
+    funder_type = lead_sponsor_info.get("class")
     collaborators = [c.get("name") for c in (sponsor.get("collaborators") or [])]
 
     design_info = design.get("designInfo") or {}
@@ -292,6 +294,7 @@ def extract_protocol_fields(study: Dict[str, Any]) -> Dict[str, Any]:
         "study_first_posted": (status.get("studyFirstPostDateStruct") or {}).get("date"),
         "last_update_posted": (status.get("lastUpdatePostDateStruct") or {}).get("date"),
         "lead_sponsor": lead_sponsor,
+        "funder_type": funder_type,
         "collaborators": _join(collaborators),
         "conditions": _join(cond.get("conditions")),
         "keywords": _join(cond.get("keywords")),
@@ -324,7 +327,7 @@ PROTOCOL_FIELD_ORDER = [
     "brief_title", "official_title", "acronym", "overall_status", "why_stopped",
     "start_date", "primary_completion_date", "completion_date",
     "study_first_posted", "last_update_posted",
-    "lead_sponsor", "collaborators", "conditions", "keywords",
+    "lead_sponsor", "funder_type", "collaborators", "conditions", "keywords",
     "study_type", "phases", "allocation", "intervention_model",
     "primary_purpose", "masking", "enrollment_count", "enrollment_type",
     "arms", "interventions", "primary_outcomes", "secondary_outcomes",
