@@ -3,14 +3,12 @@
 
 from __future__ import annotations
 
-import gc
 import io
-import json
 import math
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -69,56 +67,6 @@ _DEF_VALUE_KEYS = (
 
 _RX_NUM = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
-# Bounded category buckets so wide-format output doesn't explode into
-# thousands of near-duplicate columns across ~7,900 trials with inconsistent
-# label text from CT.gov. Anything unmatched falls back to a slugified
-# version of the raw text so nothing is silently dropped.
-RACE_BUCKETS = {
-    "white": "white",
-    "black or african american": "black_or_african_american",
-    "black": "black_or_african_american",
-    "african american": "black_or_african_american",
-    "asian": "asian",
-    "american indian or alaska native": "amind_alaska_native",
-    "american indian": "amind_alaska_native",
-    "alaska native": "amind_alaska_native",
-    "native hawaiian or other pacific islander": "nhpi",
-    "native hawaiian": "nhpi",
-    "pacific islander": "nhpi",
-    "more than one race": "multiracial",
-    "two or more races": "multiracial",
-    "multiracial": "multiracial",
-    "unknown or not reported": "unknown",
-    "not reported": "unknown",
-    "unknown": "unknown",
-}
-
-ETHNICITY_BUCKETS = {
-    "hispanic or latino": "hispanic_or_latino",
-    "not hispanic or latino": "not_hispanic_or_latino",
-    "unknown or not reported": "unknown",
-    "not reported": "unknown",
-    "unknown": "unknown",
-}
-
-GENDER_BUCKETS = {
-    "male": "male",
-    "female": "female",
-    "unknown": "unknown",
-}
-
-# Output file for incremental writes. Lives in /tmp so it survives repeated
-# st.rerun() calls within the same running process (does NOT survive a full
-# container restart after an OOM kill -- see app notes at bottom of page).
-PROGRESS_PATH = "/tmp/demographics_progress.jsonl"
-ERRORS_PATH = "/tmp/demographics_errors.jsonl"
-
-# Free-text fields (summaries, eligibility criteria) are truncated rather
-# than dropped, so a handful of unusually long trials can't blow out a
-# single Excel/CSV cell or balloon memory across ~7,900 trials.
-_MAX_LONG_TEXT = 32000
-_MAX_DETAILED_DESC = 6000
-
 # ================= HTTP Session =================================
 
 def _make_session(total_retries: int = 5, backoff: float = 0.5) -> requests.Session:
@@ -150,7 +98,7 @@ def _make_session(total_retries: int = 5, backoff: float = 0.5) -> requests.Sess
 def get_http_session() -> requests.Session:
     return _make_session()
 
-# ================= Utilities =================
+# ================= Utilities =================================
 
 def _num_like(x: Any) -> bool:
     if x is None:
@@ -169,42 +117,11 @@ def _to_float(x: Any) -> Optional[float]:
     m = _RX_NUM.search(s)
     return float(m.group(0)) if m else None
 
-def slugify(s: str) -> str:
-    s = re.sub(r"[^A-Za-z0-9]+", "_", str(s).strip().lower()).strip("_")
-    return s[:64]
+# ================= API + Normalize =================
 
-def normalize_bucket(category: str, bucket_map: Dict[str, str]) -> str:
-    c = (category or "").strip().lower()
-    if c in bucket_map:
-        return bucket_map[c]
-    for key, bucket in bucket_map.items():
-        if key in c:
-            return bucket
-    return slugify(category) if category else "unspecified"
-
-def _join(items: Optional[List[Any]], sep: str = "; ", limit: Optional[int] = None) -> str:
-    if not items:
-        return ""
-    vals = [str(x).strip() for x in items if x not in (None, "")]
-    if limit:
-        vals = vals[:limit]
-    return sep.join(vals)
-
-def _trunc(s: Any, n: int = _MAX_LONG_TEXT) -> Optional[str]:
-    if s is None:
-        return None
-    s = str(s)
-    return s if len(s) <= n else s[:n] + " …[truncated]"
-
-# ================= API (no long-lived caching of raw payloads) =================
-# NOTE: fetch_study is intentionally NOT wrapped in @st.cache_data. Caching
-# every raw CT.gov JSON payload for the life of the app session was the
-# primary driver of the OOM crash on large batches (~7,900 full payloads
-# held in memory simultaneously, on top of everything already collected).
-# Each NCT is only fetched once per run anyway, so caching bought nothing
-# here except memory pressure.
-
-def fetch_study(session: requests.Session, nct_id: str, timeout: int = 60) -> Dict[str, Any]:
+@st.cache_data(show_spinner=False)
+def fetch_study(nct_id: str, timeout: int = 60) -> Dict[str, Any]:
+    session = get_http_session()
     url = API_STUDY_URL.format(nct=nct_id)
     r = session.get(url, timeout=timeout)
     if r.status_code in (429, 503) and r.headers.get("Retry-After"):
@@ -226,119 +143,9 @@ def normalize_study(data: Dict[str, Any]) -> Dict[str, Any]:
         return data["studies"][0]
     return data
 
-# ============== Full protocol/trial-info extractor ==============
-# Pulls the "everything else" about a trial -- identification, status,
-# sponsors, design, arms/interventions, outcomes, eligibility, and
-# locations -- from protocolSection. This is independent of the results
-# payload used for demographics, so it works even for trials that have no
-# posted results yet (most trials on CT.gov have protocol data but not
-# results data).
-
-def extract_protocol_fields(study: Dict[str, Any]) -> Dict[str, Any]:
-    ps = study.get("protocolSection") or {}
-
-    ident = ps.get("identificationModule") or {}
-    status = ps.get("statusModule") or {}
-    sponsor = ps.get("sponsorCollaboratorsModule") or {}
-    desc = ps.get("descriptionModule") or {}
-    cond = ps.get("conditionsModule") or {}
-    design = ps.get("designModule") or {}
-    arms_mod = ps.get("armsInterventionsModule") or {}
-    outcomes = ps.get("outcomesModule") or {}
-    elig = ps.get("eligibilityModule") or {}
-    contacts = ps.get("contactsLocationsModule") or {}
-
-    lead_sponsor_info = sponsor.get("leadSponsor") or {}
-    lead_sponsor = lead_sponsor_info.get("name")
-    funder_type = lead_sponsor_info.get("class")
-    collaborators = [c.get("name") for c in (sponsor.get("collaborators") or [])]
-
-    design_info = design.get("designInfo") or {}
-    enrollment = design.get("enrollmentInfo") or {}
-    masking_info = design_info.get("maskingInfo") or {}
-
-    arm_groups = arms_mod.get("armGroups") or []
-    arm_strs = [
-        f"{a.get('label', '')} ({a.get('type', '')})".strip()
-        for a in arm_groups
-        if a.get("label") or a.get("type")
-    ]
-
-    interventions = arms_mod.get("interventions") or []
-    interv_strs = [
-        f"{i.get('type', '')}: {i.get('name', '')}".strip(": ").strip()
-        for i in interventions
-        if i.get("name")
-    ]
-
-    primary_outcomes = outcomes.get("primaryOutcomes") or []
-    secondary_outcomes = outcomes.get("secondaryOutcomes") or []
-
-    locations = contacts.get("locations") or []
-    loc_strs = [
-        ", ".join(
-            filter(None, [l.get("facility"), l.get("city"), l.get("state"), l.get("country")])
-        )
-        for l in locations
-    ]
-
-    return {
-        "brief_title": ident.get("briefTitle"),
-        "official_title": ident.get("officialTitle"),
-        "acronym": ident.get("acronym"),
-        "overall_status": status.get("overallStatus"),
-        "why_stopped": status.get("whyStopped"),
-        "start_date": (status.get("startDateStruct") or {}).get("date"),
-        "primary_completion_date": (status.get("primaryCompletionDateStruct") or {}).get("date"),
-        "completion_date": (status.get("completionDateStruct") or {}).get("date"),
-        "study_first_posted": (status.get("studyFirstPostDateStruct") or {}).get("date"),
-        "last_update_posted": (status.get("lastUpdatePostDateStruct") or {}).get("date"),
-        "lead_sponsor": lead_sponsor,
-        "funder_type": funder_type,
-        "collaborators": _join(collaborators),
-        "conditions": _join(cond.get("conditions")),
-        "keywords": _join(cond.get("keywords")),
-        "study_type": design.get("studyType"),
-        "phases": _join(design.get("phases")),
-        "allocation": design_info.get("allocation"),
-        "intervention_model": design_info.get("interventionModel"),
-        "primary_purpose": design_info.get("primaryPurpose"),
-        "masking": masking_info.get("masking"),
-        "enrollment_count": enrollment.get("count"),
-        "enrollment_type": enrollment.get("type"),
-        "arms": _join(arm_strs),
-        "interventions": _join(interv_strs),
-        "primary_outcomes": _join([o.get("measure") for o in primary_outcomes], limit=15),
-        "secondary_outcomes": _join([o.get("measure") for o in secondary_outcomes], limit=15),
-        "eligibility_sex": elig.get("sex"),
-        "minimum_age": elig.get("minimumAge"),
-        "maximum_age": elig.get("maximumAge"),
-        "healthy_volunteers": elig.get("healthyVolunteers"),
-        "eligibility_criteria": _trunc(elig.get("eligibilityCriteria")),
-        "locations_count": len(locations),
-        "locations": _join(loc_strs, limit=25),
-        "brief_summary": _trunc(desc.get("briefSummary")),
-        "detailed_description": _trunc(desc.get("detailedDescription"), _MAX_DETAILED_DESC),
-    }
-
-# Column order for the trial-info block, so it reads naturally left-to-right
-# regardless of dict insertion order coming back from json normalization.
-PROTOCOL_FIELD_ORDER = [
-    "brief_title", "official_title", "acronym", "overall_status", "why_stopped",
-    "start_date", "primary_completion_date", "completion_date",
-    "study_first_posted", "last_update_posted",
-    "lead_sponsor", "funder_type", "collaborators", "conditions", "keywords",
-    "study_type", "phases", "allocation", "intervention_model",
-    "primary_purpose", "masking", "enrollment_count", "enrollment_type",
-    "arms", "interventions", "primary_outcomes", "secondary_outcomes",
-    "eligibility_sex", "minimum_age", "maximum_age", "healthy_volunteers",
-    "eligibility_criteria", "locations_count", "locations",
-    "brief_summary", "detailed_description",
-]
-
 # ============== Baseline demographics walker =============
 
-def flatten_baseline_numbers_deep(study: Dict[str, Any], nct_id: str) -> List[Dict[str, Any]]:
+def flatten_baseline_numbers_deep(study: Dict[str, Any], nct_id: str) -> pd.DataFrame:
     bc = (study.get("resultsSection") or {}).get("baselineCharacteristicsModule") or {}
     measures = (
         (bc.get("baselineMeasureList") or {}).get("baselineMeasure")
@@ -358,6 +165,7 @@ def flatten_baseline_numbers_deep(study: Dict[str, Any], nct_id: str) -> List[Di
         v = _to_float(val_raw)
         if v is None:
             return
+        # filter out “overall / total / all” in labels
         label_candidates = [
             x
             for x in label_path
@@ -380,6 +188,7 @@ def flatten_baseline_numbers_deep(study: Dict[str, Any], nct_id: str) -> List[Di
             unit = "Years"
         rows.append(
             {
+                "nct_id": nct_id,
                 "measure_title": measure_title,
                 "category": category,
                 "value": v,
@@ -418,7 +227,12 @@ def flatten_baseline_numbers_deep(study: Dict[str, Any], nct_id: str) -> List[Di
         munit = m.get("units") or m.get("unitOfMeasure")
         walk(m, [mtitle], munit, mtitle)
 
-    return rows
+    df = pd.DataFrame(rows, columns=["nct_id", "measure_title", "category", "value", "unit", "value_type"])
+    if df.empty:
+        return df
+    df = df.drop_duplicates(subset=["measure_title", "category", "value", "value_type"], keep="first")
+    df = df.sort_values(["measure_title", "category"], kind="stable").reset_index(drop=True)
+    return df
 
 def measure_kind(title: str) -> str:
     t = (title or "").lower()
@@ -432,22 +246,34 @@ def measure_kind(title: str) -> str:
         return "age"
     return "other"
 
-def build_demo_columns(demo_rows: List[Dict[str, Any]], selected_measures: List[str]) -> Dict[str, Any]:
-    """Collapse one trial's demographic rows into bounded, normalized
-    column names (so ~7,900 trials don't produce thousands of
-    near-duplicate columns from inconsistent CT.gov label text)."""
-    out: Dict[str, Any] = {}
+def build_export_long(nct_id: str, demo_df: pd.DataFrame, selected_measures: List[str]) -> pd.DataFrame:
+    """Return a long-format DataFrame limited to selected measures."""
+    if demo_df.empty:
+        # Return one blank row so make_export_wide still works
+        return pd.DataFrame([{"nct_id": nct_id, "measure": None, "category": None, "value": None, "unit": None, "value_type": None}])
+    demo = demo_df.copy()
+    demo["measure"] = demo["measure_title"].map(measure_kind)
+    # Filter only selected measures
+    demo = demo[demo["measure"].isin(selected_measures)].copy()
+    return demo[["nct_id", "measure", "category", "value", "unit", "value_type"]].reset_index(drop=True)
 
-    for r in demo_rows:
-        measure = measure_kind(r.get("measure_title") or "")
-        if measure not in selected_measures:
-            continue
+def slugify(s: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9]+", "_", str(s).strip().lower()).strip("_")
+    return s[:64]
+
+def make_export_wide(export_long: pd.DataFrame) -> pd.Series:
+    """Convert long-format rows to a single wide-format row (one study)."""
+    # Grab nct_id
+    nct_id = export_long.iloc[0].get("nct_id") if not export_long.empty else None
+    out: Dict[str, Any] = {"nct_id": nct_id}
+
+    for _, r in export_long.iterrows():
+        measure = str(r.get("measure") or "")
         category = str(r.get("category") or "")
         value = r.get("value")
         vtype = r.get("value_type")
-        if value is None:
+        if pd.isna(value):
             continue
-
         if measure == "age":
             cat_lower = category.lower()
             if "mean" in cat_lower:
@@ -466,42 +292,16 @@ def build_demo_columns(demo_rows: List[Dict[str, Any]], selected_measures: List[
                 col = f"age_{slugify(category) if category else 'value'}"
             out[col] = value
         else:
-            bucket_map = {
-                "race": RACE_BUCKETS,
-                "ethnicity": ETHNICITY_BUCKETS,
-                "gender": GENDER_BUCKETS,
-            }.get(measure, {})
-            norm_cat = normalize_bucket(category, bucket_map) if bucket_map else slugify(category)
+            # For gender, race, ethnicity
             suffix = "_n" if vtype == "count" else ("_pct" if vtype == "percent" else "")
-            col = f"{measure}_{norm_cat}{suffix}"
+            col = f"{measure}_{slugify(category)}{suffix}"
             out[col] = value
 
-    if "age" in selected_measures:
-        for c in ["age_mean", "age_sd", "age_median"]:
-            out.setdefault(c, None)
+    # Guarantee basic age keys present
+    for c in ["age_mean", "age_sd", "age_median"]:
+        out.setdefault(c, None)
 
-    return out
-
-def build_wide_row(
-    nct_id: str,
-    study: Dict[str, Any],
-    selected_measures: List[str],
-    include_trial_info: bool,
-) -> Dict[str, Any]:
-    """Assemble one output row: nct_id, then (optionally) the full trial-info
-    block, then the demographic columns for the selected measures."""
-    out: Dict[str, Any] = {"nct_id": nct_id}
-
-    if include_trial_info:
-        protocol_fields = extract_protocol_fields(study)
-        for col in PROTOCOL_FIELD_ORDER:
-            out[col] = protocol_fields.get(col)
-
-    if selected_measures:
-        demo_rows = flatten_baseline_numbers_deep(study, nct_id)
-        out.update(build_demo_columns(demo_rows, selected_measures))
-
-    return out
+    return pd.Series(out)
 
 # ========== NCT ID loading ==========
 
@@ -564,63 +364,11 @@ def load_ncts_from_upload(uploaded, column: Optional[str], allow_scan: bool) -> 
         tokens.extend(_extract_ncts_from_series(df[c], allow_scan))
     return list(dict.fromkeys(tokens))
 
-# ========== Incremental disk I/O ==========
-
-def append_jsonl(path: str, record: Dict[str, Any]) -> None:
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, default=str) + "\n")
-
-def read_jsonl_ids(path: str) -> set:
-    """Read back only the id field from a jsonl file -- cheap way to know
-    what's already been processed without holding full rows in memory."""
-    ids = set()
-    if not os.path.exists(path):
-        return ids
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-                key = rec.get("nct_id") or rec.get("_nct_id")
-                if key:
-                    ids.add(key)
-            except Exception:
-                continue
-    return ids
-
-def jsonl_to_dataframe(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
-        return pd.DataFrame()
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                continue
-    return pd.DataFrame(rows)
-
-def reset_progress_files():
-    for p in (PROGRESS_PATH, ERRORS_PATH):
-        try:
-            if os.path.exists(p):
-                os.remove(p)
-        except Exception:
-            pass
-
 # ================= Streamlit UI =================
 
 st.set_page_config(page_title="CT.gov Demographics Selector", page_icon="📊", layout="wide")
-st.title("📊 ClinicalTrials.gov — Trial & Demographics Extractor")
-st.caption(
-    "Upload NCT IDs, choose which fields to pull (full trial info and/or baseline "
-    "demographics), then download Excel."
-)
+st.title("📊 ClinicalTrials.gov — Demographics Selector")
+st.caption("Upload NCT IDs, choose which features (Age, Gender, Race, Ethnicity), then download Excel.")
 
 with st.sidebar:
     st.header("1) Input NCT IDs")
@@ -641,16 +389,8 @@ with st.sidebar:
     )
 
     st.divider()
-    st.header("2) Fields to Extract")
-
-    trial_info_sel = st.checkbox(
-        "Full trial info (title, status, sponsor, design, arms/interventions, "
-        "outcomes, eligibility, locations, summary)",
-        value=True,
-        help="Pulled from protocolSection -- available even for trials with no posted results.",
-    )
-
-    st.markdown("**Baseline demographics** (from posted results, if available)")
+    st.header("2) Demographic Features to Extract")
+    # Let user pick:
     age_sel = st.checkbox("Age", value=True)
     gender_sel = st.checkbox("Gender", value=True)
     race_sel = st.checkbox("Race", value=True)
@@ -665,29 +405,18 @@ with st.sidebar:
     if ethnic_sel:
         selected.append("ethnicity")
 
-    if not trial_info_sel and not selected:
-        st.warning("Select at least one field group above.")
-
     st.divider()
     st.header("3) Options")
     process_all = st.checkbox("Process all NCT IDs", value=True)
     with st.expander("Advanced options", expanded=False):
         limit = 0 if process_all else st.number_input(
-            "Max NCTs", min_value=1, max_value=8000, value=200, step=1
-        )
-        chunk_size = st.number_input(
-            "Trials per batch before checkpoint", min_value=5, max_value=200, value=25, step=5,
-            help="Smaller batches = more frequent disk checkpoints and lower peak memory.",
+            "Max NCTs", min_value=1, max_value=5000, value=200, step=1
         )
         sleep_sec = st.number_input(
             "Politeness delay (sec)", min_value=0.0, max_value=5.0, value=0.25, step=0.05
         )
         timeout_sec = st.number_input(
             "Request timeout (sec)", min_value=5, max_value=120, value=60, step=5
-        )
-        fresh_start = st.checkbox(
-            "Start fresh (clear any previous in-progress results)", value=False,
-            help="Leave unchecked to resume a run that was interrupted earlier in this session.",
         )
 
     run_btn = st.button("Run Extraction", type="primary", use_container_width=True)
@@ -714,187 +443,83 @@ st.write(f"**Resolved NCT IDs:** {len(resolved_ncts)}")
 if resolved_ncts:
     st.code(", ".join(resolved_ncts[:10]) + (" ..." if len(resolved_ncts) > 10 else ""))
 
-# ==================== SESSION STATE (lightweight -- ids only, not full rows) ====================
-
-if "proc_state" not in st.session_state:
-    st.session_state.proc_state = {
-        "ncts": [],
-        "running": False,
-        "completed": False,
-    }
-
-# `submitted` gates the whole processing/results block. It must stay True
-# after the run finishes (proc["completed"]) so that later reruns -- e.g.
-# a user clicking one of the download buttons below, which Streamlit
-# handles by rerunning the whole script -- still render the results
-# instead of falling back to the "click Run Extraction" placeholder.
-submitted = (
-    run_btn
-    or st.session_state.proc_state["running"]
-    or st.session_state.proc_state.get("completed", False)
-)
+submitted = bool(run_btn)
 
 if submitted and not resolved_ncts:
-    st.info("To get started:\n1) Upload a file or paste NCT IDs\n2) Click **Run Extraction**")
-    st.stop()
-
-if submitted and not trial_info_sel and not selected:
-    st.error("Select at least one field group in the sidebar (trial info and/or demographics).")
+    st.info(
+        "To get started:\n"
+        "1) Upload a file or paste NCT IDs\n"
+        "2) Click **Run Extraction**"
+    )
     st.stop()
 
 if submitted:
-    proc = st.session_state.proc_state
+    prog = st.progress(0)
+    status = st.empty()
+    wide_rows: List[pd.Series] = []
+    errors: List[Tuple[str, str]] = []
 
-    # New batch, or explicit fresh start requested
-    if proc["ncts"] != resolved_ncts or (run_btn and fresh_start):
-        proc["ncts"] = resolved_ncts
-        proc["running"] = True
-        proc["completed"] = False
-        reset_progress_files()
+    for i, nct in enumerate(resolved_ncts, start=1):
+        status.write(f"Fetching **{nct}** ({i}/{len(resolved_ncts)}) …")
+        try:
+            raw = fetch_study(nct, timeout=int(timeout_sec))
+            study = normalize_study(raw)
+            if not study:
+                raise RuntimeError("Empty or unknown study payload")
 
-    # What's already done, read straight from disk -- this is what makes
-    # the run resumable across reruns within the same live process, and
-    # keeps session_state itself tiny regardless of batch size.
-    processed_ids = read_jsonl_ids(PROGRESS_PATH) | read_jsonl_ids(ERRORS_PATH)
-    remaining = [n for n in proc["ncts"] if n not in processed_ids]
-    total = len(proc["ncts"])
-    done = total - len(remaining)
+            demo_df = flatten_baseline_numbers_deep(study, nct)
+            export_long = build_export_long(nct, demo_df, selected)
+            row = make_export_wide(export_long)
+            row["nct_id"] = nct
+            wide_rows.append(row)
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total", total)
-    col2.metric("Processed", done)
-    col3.metric("Remaining", len(remaining))
+        except Exception as e:
+            errors.append((nct, str(e)))
 
-    # Always-available checkpoint download so partial progress is never
-    # trapped in memory if something does go wrong before the run finishes.
-    # Converted to CSV here (rather than handing back the raw .jsonl
-    # checkpoint file) so it's directly openable in Excel/Sheets.
-    if done > 0 and os.path.exists(PROGRESS_PATH):
-        progress_df = jsonl_to_dataframe(PROGRESS_PATH)
-        if not progress_df.empty:
-            st.download_button(
-                f"⬇️ Download progress so far ({done:,} of {total:,} trials)",
-                progress_df.to_csv(index=False).encode(),
-                "trials_progress.csv",
-                "text/csv",
-                use_container_width=True,
-            )
+        prog.progress(i / len(resolved_ncts))
+        if sleep_sec and float(sleep_sec) > 0:
+            time.sleep(float(sleep_sec))
 
-    if remaining:
-        session = get_http_session()
-        chunk = remaining[: int(chunk_size)]
-        prog = st.progress(done / total if total else 0.0)
-        status = st.empty()
+    if not wide_rows:
+        st.error("No rows produced. Check errors or try a different set of NCT IDs.")
+        if errors:
+            with st.expander("Errors"):
+                for nct, msg in errors[:100]:
+                    st.write(f"**{nct}** — {msg}")
+        st.stop()
 
-        for i, nct in enumerate(chunk):
-            curr = done + i + 1
-            status.write(f"Fetching **{nct}** ({curr}/{total}) …")
-            try:
-                raw = fetch_study(session, nct, timeout=int(timeout_sec))
-                study = normalize_study(raw)
-                if not study:
-                    raise RuntimeError("Empty study")
+    wide_df = pd.DataFrame(wide_rows)
+    # Reorder so nct_id is first
+    cols = wide_df.columns.tolist()
+    if "nct_id" in cols:
+        cols = ["nct_id"] + [c for c in cols if c != "nct_id"]
+        wide_df = wide_df[cols]
 
-                row_dict = build_wide_row(nct, study, selected, trial_info_sel)
-                append_jsonl(PROGRESS_PATH, row_dict)
+    st.success(f"Done. Extracted {len(wide_df)} records.")
+    st.dataframe(wide_df.head(50), use_container_width=True)
 
-                # Drop references immediately rather than waiting on scope exit
-                del raw, study, row_dict
-            except Exception as e:
-                append_jsonl(ERRORS_PATH, {"nct_id": nct, "error": str(e)})
+    # Export to Excel
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        wide_df.to_excel(writer, index=False, sheet_name="Demographics_Wide")
+    buf.seek(0)
+    st.download_button(
+        label="⬇️ Download Excel (Demographics_Wide)",
+        data=buf.getvalue(),
+        file_name="demographics_extracted.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
-            prog.progress(curr / total if total else 0.0)
-            if sleep_sec > 0:
-                time.sleep(float(sleep_sec))
+    if errors:
+        err_df = pd.DataFrame(errors, columns=["nct_id", "error"])
+        st.download_button(
+            "⬇️ Download failures (.csv)",
+            err_df.to_csv(index=False).encode(),
+            file_name="failures.csv",
+            use_container_width=True,
+        )
+        with st.expander("Some records failed (up to 100 shown)"):
+            for nct, msg in errors[:100]:
+                st.write(f"**{nct}** — {msg}")
 
-        gc.collect()
-
-        new_done = done + len(chunk)
-        if new_done < total:
-            st.info(f"✅ Checkpointed {new_done}/{total}. Continuing...")
-            time.sleep(0.5)
-            st.rerun()
-        else:
-            # Finished. Do NOT st.rerun() here -- on the rerun, run_btn is
-            # False (it's only True on an actual button click) and
-            # `running` is now False too, so `submitted` would evaluate to
-            # False and the results section below would never render.
-            # Instead, fall through in this same script execution straight
-            # into the results/download block.
-            proc["running"] = False
-            proc["completed"] = True
-
-    if not proc["running"]:
-        st.divider()
-        n_errors = len(read_jsonl_ids(ERRORS_PATH))
-        wide_df = jsonl_to_dataframe(PROGRESS_PATH)
-
-        if not wide_df.empty:
-            cols = wide_df.columns.tolist()
-            if "nct_id" in cols:
-                cols = ["nct_id"] + [c for c in cols if c != "nct_id"]
-                wide_df = wide_df[cols]
-
-            st.success(f"✅ COMPLETE! Extracted {len(wide_df)} records from {total} NCT IDs.")
-            st.write(f"**Dataframe shape: {wide_df.shape[0]} rows × {wide_df.shape[1]} columns**")
-
-            st.info(f"Showing first 100 of {len(wide_df)} total records")
-            st.dataframe(wide_df.head(100), use_container_width=True)
-            st.caption(
-                "Note: the ⭳ icon in the corner of this table only exports the "
-                "100 rows shown above. Use the full-dataset download buttons below."
-            )
-
-            st.write("---")
-            st.subheader("📥 Download Results")
-
-            csv_data = wide_df.to_csv(index=False).encode()
-            st.download_button(
-                "⬇️ Download CSV ({:,} records)".format(len(wide_df)),
-                csv_data,
-                "trials_extracted.csv",
-                "text/csv",
-                use_container_width=True,
-            )
-
-            try:
-                buf = io.BytesIO()
-                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                    if len(wide_df) > 1_000_000:
-                        for i in range(0, len(wide_df), 100_000):
-                            chunk_df = wide_df.iloc[i:i + 100_000]
-                            sheet_name = f"Data_{i // 100_000 + 1}"
-                            chunk_df.to_excel(writer, index=False, sheet_name=sheet_name)
-                    else:
-                        wide_df.to_excel(writer, index=False, sheet_name="Trials_Wide")
-                buf.seek(0)
-                st.download_button(
-                    "⬇️ Download Excel ({:,} records)".format(len(wide_df)),
-                    buf.getvalue(),
-                    "trials_extracted.xlsx",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-            except Exception:
-                st.warning("Excel export unavailable for this file size")
-
-            if n_errors:
-                err_df = jsonl_to_dataframe(ERRORS_PATH)
-                st.write("---")
-                st.warning(f"⚠️ {n_errors} NCT IDs failed")
-                st.download_button(
-                    f"⬇️ Download failures ({n_errors} records)",
-                    err_df.to_csv(index=False).encode(),
-                    "failures.csv",
-                    use_container_width=True,
-                )
-                with st.expander(f"Show errors (up to 100 of {n_errors})"):
-                    for _, r in err_df.head(100).iterrows():
-                        st.write(f"**{r['nct_id']}** — {r['error']}")
-        else:
-            st.error("No records extracted.")
-            if n_errors:
-                err_df = jsonl_to_dataframe(ERRORS_PATH)
-                with st.expander("Errors"):
-                    for _, r in err_df.head(50).iterrows():
-                        st.write(f"**{r['nct_id']}** — {r['error']}")
